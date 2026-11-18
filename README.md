@@ -103,6 +103,8 @@ python3 tools/astk_selftest.py some_70s.wav --socket /tmp/astk-st/engine.sock --
 ASTK_ENGINE_SOCKET=/tmp/astk-st/engine.sock sh run_engine.sh
 ```
 
+`--idle-gap 15`를 더하면 세션 교체 때 15초 동안 AUDIO를 보내지 않습니다(`audiostackd --idle`에서 `session stop` 뒤 `session start`까지와 같음). 둘째 세션의 시각이 쉰 시간만큼 밀리지 않는지 봅니다.
+
 Mac에서는 NPU 대신 ONNX로 같은 흐름을 돌릴 수 있습니다(동작 확인용이며, 정확도와 속도는 보드 값이 아님). ONNX 모델(양자화 전, 약 1.1 GB)도 Release `v0.1`에 있습니다:
 
 ```bash
