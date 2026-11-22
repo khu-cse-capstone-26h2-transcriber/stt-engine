@@ -38,6 +38,7 @@ ap.add_argument("--bins", default=str(pathlib.Path.home() / "rubikpi/bins"))
 ap.add_argument("--overlap", type=float, default=1.5)
 ap.add_argument("--min-len", type=float, default=3.0)
 ap.add_argument("--soft-len", type=float, default=6.0)
+ap.add_argument("--pauses", default="1.0,0.5,0.2", help="pause (s) that ends a segment shorter than --min-len, up to --soft-len, longer")
 ap.add_argument("--vad", default="energy", choices=["energy", "silero"])
 ap.add_argument("--fleurs", type=int, default=0, help="stream the first N sentences of fleurs70/")
 ap.add_argument("--gap", type=float, default=0.6, help="pause between FLEURS sentences (s)")
@@ -60,6 +61,10 @@ ap.add_argument("--stable", default="off", choices=["off", "partial", "final"],
                 help="partial stabilization: tokens two partials in a row agree on (up to a word boundary) are committed and "
                      "fed to the decoder as a forced prefix of later partials (partial) and of the final too (final); "
                      "RESULT partials carry stable_chars")
+ap.add_argument("--early-final", action="store_true",
+                help="start the final as soon as its audio is fixed (6 silent frames), while the pause is still being confirmed;"
+                     " the result is used if the pause is confirmed with the same audio (identical output), dropped if speech resumes")
+ap.add_argument("--no-abort", action="store_true", help="let a running partial finish when a final is ready (old behaviour)")
 ap.add_argument("--hold-last", action="store_true",
                 help="partials leave out their last word (often cut off mid-word; it comes with the next partial or the final)")
 ap.add_argument("--dec", help="decoder .bin name in --bins (default dec_<window>s.bin), e.g. dec_10s_pv.bin")
@@ -237,11 +242,16 @@ if a.vad == "silero":
         _st[1] = f[-64:]; return float(o[0, 0])
 
 
-pending = [None]; plock = threading.Lock(); pstats = {"run": [], "skipped": 0}
+pending = [None]; plock = threading.Lock(); pstats = {"run": [], "skipped": 0, "aborted": 0}
+# --early-final: the tentative final (seg_no, start, end, audio) waiting to run, its result keyed by (seg_no, start, end)
+spec = [None]; spec_res = {}; sstats = {"run": 0, "used": 0, "aborted": 0}
+sbusy = threading.Event(); sabort = threading.Event()  # a tentative final is being decoded / speech resumed: drop it
+pbusy = threading.Event()                            # a partial is being decoded: a new final stops it (model.abort)
+pabort = threading.Event()                           # ... and it was stopped: its result is dropped
 
 
 def segmenter():
-    def new(off): return Segmenter(FRAME, a.window, a.min_len, a.soft_len, a.overlap, cut=a.cut, dip_db=a.dip_db, adaptive=a.adapt,
+    def new(off): return Segmenter(FRAME, a.window, a.min_len, a.soft_len, a.overlap, cut=a.cut, dip_db=a.dip_db, adaptive=a.adapt, pauses=tuple(map(float, a.pauses.split(","))),
                                 speech_prob=speech_prob if a.vad == "silero" else None, offset=off)
     sg = new(0); seg_no, last_p = 0, 0
     sess = {"id": None, "start": 0, "base": 0, "t0": None}   # session id, its first sample, first seg_no, first sample's capture time
@@ -259,6 +269,7 @@ def segmenter():
         for s, x, forced, info in segs:
             info.update(sid=sess["id"], seg=seg_no - sess["base"], **times(s, s + len(x)))
             segq.put((seg_no, s, s + len(x), x, forced, info)); seg_no += 1; last_p = 0
+            if pbusy.is_set() and not a.no_abort: pabort.set(); model.abort()   # the final should not wait for a partial
 
     def session_marks(upto, nxt):                       # marks at positions <= upto; nxt = stream position of the next frame
         nonlocal sg
@@ -275,7 +286,14 @@ def segmenter():
             session_marks(ring.r + FRAME - 1, ring.r); continue
         session_marks(ring.r - FRAME, ring.r - FRAME)
         put(sg.feed(f))
-        if a.partial and sg.speaking:
+        if a.early_final:
+            if (t := sg.tentative()) is not None:       # this segment's audio is fixed: decode it while the pause is confirmed
+                with plock: spec[0] = (seg_no, t[0], t[0] + len(t[1]), t[1]); pending[0] = None
+            elif sg.speaking and sg.sil == 0:           # speech went on: the tentative final is no longer this segment
+                with plock: spec[0] = None
+                if sbusy.is_set() and not sabort.is_set(): sabort.set(); model.abort()
+        if a.partial and sg.speaking and not (a.early_final and sg.sil >= 6):   # no partial once the final is decided
+
             n = len(sg.frames) * FRAME
             if n >= 1.5 * SR and n - last_p >= a.partial * SR:
                 x = np.concatenate([fr for fr, _, _ in sg.frames]); last_p = n; s = sg.offset + sg.start * FRAME
@@ -341,7 +359,12 @@ def run_partial(job, done):
     if n <= done: pstats["skipped"] += 1; return        # its final already went out
     ts = time.perf_counter()
     com = committed(n) if a.stable != "off" else []
-    enc_ms = model.encode(log_mel(x, a.window)); toks, dec_ms, _ = model.decode(seconds=len(x) / SR, forced=com)
+    pabort.clear(); pbusy.set(); model.abortable(not a.no_abort)
+    try:
+        enc_ms = model.encode(log_mel(x, a.window)); toks, dec_ms, _ = model.decode(seconds=len(x) / SR, forced=com)
+    finally: pbusy.clear()
+    if pabort.is_set():                              # a final came in and cut this partial short: drop it
+        pstats["aborted"] += 1; print(f"[partial seg {n}] stopped for a final ({len(toks)} tok)", flush=True); return
     full = com + toks
     text = clean_text(detok(full), False); proc = time.perf_counter() - ts
     stable = None
@@ -355,6 +378,20 @@ def run_partial(job, done):
     shown = text if stable is None else f"{text[:stable]}|{text[stable:]}"
     print(f"[partial {s/SR:6.1f}~{e/SR:6.1f}s seg {n}] enc {enc_ms:3.0f}ms dec {dec_ms:4.0f}ms ({len(toks)} tok) "
           f"latency {lat:4.2f}s | {shown}", flush=True)
+
+
+def run_spec(job, done):
+    n, s, e, x = job
+    if n <= done: return
+    com = committed(n) if a.stable == "final" else []
+    ts = time.perf_counter()
+    sabort.clear(); sbusy.set(); model.abortable(True)
+    try:
+        enc_ms = model.encode(log_mel(x, a.window)); toks, dec_ms, _ = model.decode(seconds=len(x) / SR, forced=com)
+    finally: sbusy.clear()
+    sstats["run"] += 1
+    if sabort.is_set(): sstats["aborted"] += 1; return
+    spec_res.clear(); spec_res[(n, s, e)] = (toks, enc_ms, dec_ms, com, time.perf_counter() - ts)
 
 
 def latency(e):
@@ -378,6 +415,8 @@ def infer():
     while True:
         try: item = segq.get(timeout=0.02)
         except queue.Empty:                              # nothing final waiting -> newest partial, if any
+            with plock: sj, spec[0] = spec[0], None
+            if sj: run_spec(sj, done); continue
             with plock: job, pending[0] = pending[0], None
             if job: run_partial(job, done)
             continue
@@ -390,7 +429,12 @@ def infer():
         n, s, e, x, forced, info = item
         ts = time.perf_counter()
         com = committed(n) if a.stable == "final" else []
-        enc_ms = model.encode(log_mel(x, a.window)); toks, dec_ms, _ = model.decode(seconds=len(x) / SR, forced=com)
+        r = spec_res.pop((n, s, e), None)
+        if r is not None and r[3] == com:                # decoded early from the same audio: same result, already done
+            toks, enc_ms, dec_ms = r[:3]; sstats["used"] += 1
+        else:
+            if a.partial or a.early_final: model.abortable(False)
+            enc_ms = model.encode(log_mel(x, a.window)); toks, dec_ms, _ = model.decode(seconds=len(x) / SR, forced=com)
         text = clean_text(detok(com + toks), True); proc = time.perf_counter() - ts
         if prev_forced: text = merge(last, text)
         out.append(text); last = text or last; prev_forced = forced; done = n
@@ -433,8 +477,10 @@ print(f"cuts: pause {kinds.count('pause') + kinds.count('end')}, dip {kinds.coun
 if a.lp_min is not None: print(f"FILTER lp < {a.lp_min}: {fstats['segs']} segments, {fstats['chars']} chars dropped")
 if a.partial:
     pr = pstats["run"]
-    print(f"PARTIAL every {a.partial}s: {len(pr)} run, {pstats['skipped']} skipped"
+    print(f"PARTIAL every {a.partial}s: {len(pr)} run, {pstats['skipped']} skipped, {pstats['aborted']} stopped for a final"
           + (f", latency avg {np.mean([l for _, l in pr]):.2f}s max {max(l for _, l in pr):.2f}s, proc avg {np.mean([p for p, _ in pr]):.2f}s" if pr else ""))
+if a.early_final:
+    print(f"EARLY final: {sstats['run']} started, {sstats['used']} used, {sstats['aborted']} dropped (speech went on)")
 if stats:
     print(f"{len(stats)} segments, RTF {sum(st[1] for st in stats) / max(seg_s, 1e-9):.3f}, "
           f"latency avg {np.mean([st[2] for st in stats]):.2f}s max {max(st[2] for st in stats):.2f}s, max queued {max(st[3] for st in stats)}")

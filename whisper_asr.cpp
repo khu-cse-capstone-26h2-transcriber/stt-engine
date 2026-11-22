@@ -110,15 +110,16 @@ bool same_enc(const Buf& a, const Buf& b) {
 }
 
 // Copy src -> dst, requantizing if the encodings differ (lookup table per src/dst pair: 9 M values per encode).
-void requant(const Buf& src, Buf& dst) {
-  if (same_enc(src, dst)) { memcpy(dst.own, src.cur, dst.bytes); return; }
+// off: start element in src (a decoder fed per head takes one head's slice of the encoder's cross cache).
+void requant(const Buf& src, Buf& dst, size_t off = 0) {
+  if (same_enc(src, dst)) { memcpy(dst.own, src.cur + off * src.esize, dst.bytes); return; }
   static std::map<std::pair<const Buf*, const Buf*>, std::vector<uint32_t>> luts;
   auto& lut = luts[{&src, &dst}];
   if (lut.empty()) {
     lut.resize(src.esize == 1 ? 256 : 65536);
     for (size_t q = 0; q < lut.size(); q++) lut[q] = quantize(dst, src.scale * ((float)q + src.offset));
   }
-  const uint8_t* s = src.cur;
+  const uint8_t* s = src.cur + off * src.esize;
   if (src.esize == 2 && dst.esize == 2) {
     const uint16_t* a = (const uint16_t*)s; uint16_t* o = (uint16_t*)dst.own;
     for (size_t i = 0; i < dst.elems; i++) o[i] = (uint16_t)lut[a[i]];
@@ -180,7 +181,7 @@ void load(Graph& G, const std::string& path) {
 }
 
 // AI Hub context binaries name outputs output_0, output_1, ... in the source ONNX output order.
-// Give them the source names (encoder: k/v_cache_cross_i; decoder and prefix decoder: logits, k/v_cache_self_i_out)
+// Give them the source names (encoder: k/v_cache_cross_i; decoder and prefix decoder: logits, k/v_cache_self_i_out or _new)
 // and check shapes.
 void name_outputs(Graph& G, bool encoder) {
   for (size_t i = 0; i < G.out.size(); i++) {
@@ -189,8 +190,10 @@ void name_outputs(Graph& G, bool encoder) {
     int k = std::stoi(b.name.substr(7));
     std::string n;
     if (encoder) n = std::string(k % 2 ? "v" : "k") + "_cache_cross_" + std::to_string(k / 2);
-    else n = k == 0 ? "logits" : std::string((k - 1) % 2 ? "v" : "k") + "_cache_self_" + std::to_string((k - 1) / 2) + "_out";
     auto* d = b.t.v1.dimensions; uint32_t r = b.t.v1.rank;
+    // new-token-only self cache (scripts/self_new_only.py): one slot, K [H,1,D,1] / V [H,1,1,D] -> "<x>_new"
+    if (!encoder) n = k == 0 ? "logits" : std::string((k - 1) % 2 ? "v" : "k") + "_cache_self_" + std::to_string((k - 1) / 2) +
+                      (r == 4 && ((k - 1) % 2 ? d[2] : d[3]) == 1 ? "_new" : "_out");
     bool ok = n == "logits" ? (r == 4 && d[1] > 1000) : r == 4 && (n[0] == 'k' ? d[2] == 64 : d[3] == 64);
     if (!ok) throw std::runtime_error("output " + b.name + " -> " + n + ": unexpected shape");
     G.out_idx.erase(b.name); b.name = n; G.out_idx[n] = (int)i;
@@ -329,6 +332,13 @@ struct Engine::Impl {
   Graph E, D, Pre;                  // Pre: prefix decoder (optional, Pre.g == nullptr when not loaded)
   std::vector<std::pair<int, int>> self;  // self cache (out idx, in idx)
   std::vector<std::pair<int, int>> pre_self;  // prefix decoder self cache out idx -> step decoder in idx
+  // Decoder with new-token-only self cache outputs (scripts/self_new_only.py): output "<x>_new" [H,1,D,1] (K) or
+  // [H,1,1,D] (V) is written into slot (slots - 1 - step) of input "<x>_in" [H,1,D,slots] / [H,1,slots,D].
+  // Attention does not depend on slot order, so this fills the same slots the shifting cache used, in reverse.
+  struct NewKV { int out, in; size_t H, A, B; bool k; };
+  std::vector<NewKV> self_new;
+  struct Cross { Graph* g; int src, dst; size_t off; };
+  std::vector<Cross> cross;  // encoder cross cache output (from element off) -> decoder input, copied after each encode
   int window = 10, max_new = 120, last_steps = 0;
   float last_lp = 0;   // average log probability of the chosen tokens in the last decode
   bool pin = true;
@@ -368,21 +378,46 @@ Engine::Engine(const std::string& enc_bin, const std::string& dec_bin, const std
   P.window = (int)(P.E.in[0].elems / NMEL / 100);
 
   // Encoder outputs (cross KV cache) -> decoder inputs; share memory when encodings match.
+  // A decoder may take the cross cache per head (inputs <name>_h0.._h{H-1}, scripts/split_cross_heads.py):
+  // each head is a contiguous slice of the encoder output (heads are the first axis).
   for (Graph* G : {&P.D, &P.Pre}) {
     if (!G->g) continue;
-    for (auto& o : P.E.out) {
-      if (!G->in_idx.count(o.name)) throw std::runtime_error("encoder output " + o.name + " has no decoder input");
-      Buf& di = G->I(o.name);
-      if (same_enc(o, di) && o.bytes == di.bytes) G->point(di, o.data());
-      else fprintf(stderr, "  requant %s (enc %g/%d -> %s %g/%d)\n", o.name.c_str(), o.scale, o.offset,
-                   G == &P.D ? "dec" : "prefix", di.scale, di.offset);
+    for (size_t k = 0; k < P.E.out.size(); k++) {
+      Buf& o = P.E.out[k];
+      if (G->in_idx.count(o.name)) {
+        Buf& di = G->I(o.name);
+        if (same_enc(o, di) && o.bytes == di.bytes) { G->point(di, o.data()); continue; }
+        fprintf(stderr, "  requant %s (enc %g/%d -> %s %g/%d)\n", o.name.c_str(), o.scale, o.offset,
+                G == &P.D ? "dec" : "prefix", di.scale, di.offset);
+        P.cross.push_back({G, (int)k, G->in_idx.at(o.name), 0});
+        continue;
+      }
+      int H = 0; while (G->in_idx.count(o.name + "_h" + std::to_string(H))) H++;
+      if (!H) throw std::runtime_error("encoder output " + o.name + " has no decoder input");
+      if (o.elems % H) throw std::runtime_error(o.name + ": size not divisible by " + std::to_string(H) + " heads");
+      for (int h = 0; h < H; h++) {
+        int di = G->in_idx.at(o.name + "_h" + std::to_string(h));
+        if (G->in[di].elems != o.elems / H) throw std::runtime_error(o.name + "_h: head size mismatch");
+        P.cross.push_back({G, (int)k, di, (size_t)h * (o.elems / H)});
+      }
     }
   }
+  fprintf(stderr, "[wire] %zu cross cache copies per encode\n", P.cross.size());
   // Self cache: output "<x>_out" feeds input "<x>_in" on the next step.
   for (auto& o : P.D.out) {
     if (o.name.size() < 4 || o.name.compare(o.name.size() - 4, 4, "_out")) continue;
     P.self.push_back({P.D.out_idx.at(o.name), P.D.in_idx.at(o.name.substr(0, o.name.size() - 4) + "_in")});
   }
+  for (auto& o : P.D.out) {
+    if (o.name.size() < 4 || o.name.compare(o.name.size() - 4, 4, "_new")) continue;
+    int ii = P.D.in_idx.at(o.name.substr(0, o.name.size() - 4) + "_in"); Buf& in = P.D.in[ii];
+    auto* id = in.t.v1.dimensions; auto* od = o.t.v1.dimensions;
+    if (in.t.v1.rank != 4 || o.t.v1.rank != 4 || id[0] != od[0]) throw std::runtime_error(o.name + ": unexpected shape");
+    bool k = od[3] == 1;                       // K: [H,1,D,1] into [H,1,D,slots]; V: [H,1,1,D] into [H,1,slots,D]
+    if (k ? od[2] != id[2] : (od[2] != 1 || od[3] != id[3])) throw std::runtime_error(o.name + ": shape does not match " + in.name);
+    P.self_new.push_back({P.D.out_idx.at(o.name), ii, id[0], id[2], id[3], k});
+  }
+  if (!P.self_new.empty()) fprintf(stderr, "[wire] %zu self cache outputs are new-token only\n", P.self_new.size());
   int n_rq = 0; for (auto& s : P.self) n_rq += !same_enc(P.D.out[s.first], P.D.in[s.second]);
   fprintf(stderr, "[wire] %zu self cache pairs, %d need requant per step\n", P.self.size(), n_rq);
   if (P.Pre.g) {   // prefix decoder: its self cache outputs (199 slots = after 4 steps) feed the step decoder's inputs
@@ -430,12 +465,12 @@ double Engine::encode(const float* mel) {
   Buf& x = P.E.in[0];
   for (size_t i = 0; i < x.elems; i++) put(x, i, x.quant ? quantize(x, mel[i]) : 0);
   P.E.exec();
-  for (Graph* G : {&P.D, &P.Pre})
-    if (G->g) for (auto& o : P.E.out) { Buf& di = G->I(o.name); if (di.cur != o.data()) requant(o, di); }
+  for (auto& c : P.cross) requant(P.E.out[c.src], c.g->in[c.dst], c.off);
   return ms_since(t);
 }
 
-std::vector<int> Engine::decode(const std::vector<int>& pre, int max_new, double* total_ms, double* npu_ms, double audio_s) {
+std::vector<int> Engine::decode(const std::vector<int>& pre, int max_new, double* total_ms, double* npu_ms, double audio_s,
+                                 const volatile int* abort) {
   auto& P = *p_; auto& D = P.D;
   if (P.pin) pin_fast_cores();
   auto t = clk::now(); double npu = 0;
@@ -443,6 +478,10 @@ std::vector<int> Engine::decode(const std::vector<int>& pre, int max_new, double
   const size_t ctx = mask.elems;
   for (auto& s : P.self) {   // self cache to quantized zero
     Buf& in = D.in[s.second]; D.point(in, in.data());
+    uint32_t z = quantize(in, 0.f); for (size_t i = 0; i < in.elems; i++) put(in, i, z);
+  }
+  for (auto& s : P.self_new) {   // same for caches filled slot by slot
+    Buf& in = D.in[s.in]; D.point(in, in.data());
     uint32_t z = quantize(in, 0.f); for (size_t i = 0; i < in.elems; i++) put(in, i, z);
   }
   uint32_t qneg = quantize(mask, -1e9f), qzero = quantize(mask, 0.f);   // "masked" clamps to the lowest value
@@ -475,18 +514,34 @@ std::vector<int> Engine::decode(const std::vector<int>& pre, int max_new, double
     }
     return true;
   };
-  if (P.Pre.g && pre == korean_prefix()) {   // the 4 forced tokens in one call (inputs were set at load)
+  const auto& kp = korean_prefix();
+  if (P.Pre.g && pre.size() >= kp.size() && std::equal(kp.begin(), kp.end(), pre.begin())) {
+    // the 4 start tokens in one call (inputs were set at load); further forced tokens (e.g. committed partial text)
+    // follow as normal steps below
     auto te = clk::now(); P.Pre.exec(); npu += ms_since(te); runs++;
     for (auto& s : P.pre_self) requant(P.Pre.out[s.first], D.in[s.second]);   // memcpy when encodings match
-    for (step = 0; step < (int)pre.size(); step++) put(mask, ctx - step - 1, qzero);
-    { size_t b0 = argmax(P.Pre.O("logits")); add_lp(P.Pre.O("logits"), b0); go = take(b0); }
+    for (step = 0; step < (int)kp.size(); step++) put(mask, ctx - step - 1, qzero);
+    if (pre.size() > kp.size()) tok = pre[kp.size()];   // next forced token
+    else { size_t b0 = argmax(P.Pre.O("logits")); add_lp(P.Pre.O("logits"), b0); go = take(b0); }
   }
   for (; go && step < (int)ctx - 1; step++) {
+    if (abort && *abort) break;   // the caller no longer needs this result (e.g. a partial overtaken by a final)
     put(mask, ctx - step - 1, qzero);
     ((int32_t*)ids.data())[0] = tok;
     ((int32_t*)pos.data())[0] = step;
     auto te = clk::now(); D.exec(); npu += ms_since(te); runs++;
     size_t best = argmax(logits);
+    for (auto& s : P.self_new) {   // new token's K/V into a free slot of the input cache
+      const Buf& o = D.out[s.out]; Buf& in = D.in[s.in];
+      const size_t slots = s.k ? s.B : s.A, D_ = s.k ? s.A : s.B, slot = slots - 1 - (size_t)step;
+      const bool same = same_enc(o, in);
+      for (size_t h = 0; h < s.H; h++)
+        for (size_t d = 0; d < D_; d++) {
+          size_t src = h * D_ + d, dst = h * s.A * s.B + (s.k ? d * s.B + slot : slot * s.B + d);
+          uint32_t q = o.esize == 1 ? o.cur[src] : o.esize == 2 ? ((const uint16_t*)o.cur)[src] : ((const uint32_t*)o.cur)[src];
+          put(in, dst, same ? q : quantize(in, o.scale * ((float)q + o.offset)));
+        }
+    }
     for (auto& s : P.self) {   // this step's self cache outputs become next step's inputs
       Buf& o = D.out[s.first]; Buf& in = D.in[s.second];
       if (same_enc(o, in)) { uint8_t* co = o.cur; uint8_t* ci = in.cur; D.point(in, co); D.point(o, ci); }   // swap

@@ -18,14 +18,14 @@ SR = 16000
 
 class Segmenter:
     def __init__(self, frame, window=10, min_len=3.0, soft_len=6.0, overlap=1.5, cut="last",
-                 dip_from=5.0, dip_ms=150, dip_db=12.0, speech_prob=None, offset=0, adaptive=False):
+                 dip_from=5.0, dip_ms=150, dip_db=12.0, speech_prob=None, offset=0, adaptive=False, pauses=(1.0, 0.5, 0.2)):
         self.FD = FD = frame / SR
         self.frame, self.speech_prob, self.cut = frame, speech_prob, cut
         self.adaptive = adaptive                   # noise-aware thresholds: pause and word-gap tests follow the measured noise floor
         self.floor = -100.0                        # 5th percentile of the last 10 s (dB), the noise floor estimate
         self.offset = offset                       # stream sample position of this segmenter's first frame
-        self.pre, self.end_sil, self.long_sil = int(0.3 / FD), int(0.5 / FD), int(1.0 / FD)
-        self.short_sil = int(0.2 / FD)
+        # pause that ends a segment: shorter than min_len / up to soft_len / longer (s)
+        self.pre, self.long_sil, self.end_sil, self.short_sil = int(0.3 / FD), *(int(p / FD) for p in pauses)
         self.min_f, self.soft_f = int(min_len / FD), int(soft_len / FD)
         self.max_f, self.ov_f = int(window / FD) - 1, int(overlap / FD)
         self.dip_lo, self.dip_k, self.dip_db = int(dip_from / FD), max(1, round(dip_ms / 1000 / FD)), dip_db
@@ -38,6 +38,16 @@ class Segmenter:
         x = np.concatenate([f for f, _, _ in frames])
         return (self.offset + self.start * self.frame, x, forced,
                 {"kind": kind, "depth_db": depth, "decided": self.offset + self.pos * self.frame})
+
+    def tentative(self):
+        """The pause segment this segment ends with if the silence goes on, as soon as its audio is fixed: a pause cut
+        keeps 6 silent frames, so after 6 the audio no longer changes, only the decision waits for the full pause.
+        Returns (start sample, audio) once, at that frame, or None (not there yet, or the cut happens right now)."""
+        if not self.speaking or self.sil != 6: return None
+        n = len(self.frames) - self.sil
+        need = self.long_sil if n < self.min_f else self.end_sil if n < self.soft_f else self.short_sil
+        if need <= 6: return None
+        return self.offset + self.start * self.frame, np.concatenate([f for f, _, _ in self.frames])
 
     def depth_at(self, frames, i):
         """dB the `dip_k` frames centred on boundary i lie below the median level of the voiced frames."""

@@ -48,7 +48,9 @@ class Engine {
   double encode(const float* mel);                                     // returns ms
   // audio_seconds > 0 turns on the repeat stop: once more than 5 tokens per second of audio have come out and the
   // last 5 tokens repeat an earlier run, decoding stops and that repeat is dropped (the model sometimes loops).
-  std::vector<int> decode(const std::vector<int>& prefix, int max_new, double* total_ms, double* npu_ms, double audio_seconds = 0);
+  // abort: if given and set (e.g. by a signal handler) decoding stops before the next step and returns what it has.
+  std::vector<int> decode(const std::vector<int>& prefix, int max_new, double* total_ms, double* npu_ms, double audio_seconds = 0,
+                          const volatile int* abort = nullptr);
   std::string detok(const std::vector<int>& ids) const;
   float last_avg_logprob() const;                                      // of the last decode()
 

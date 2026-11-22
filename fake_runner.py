@@ -20,6 +20,7 @@ while (c := rd.read(1)):
         cross = dict(zip(e_out, E.run(None, {E.get_inputs()[0].name: mel})))
         wr.write(struct.pack("<f", 0.0)); wr.flush()
     elif c == b"G": rd.read(4)
+    elif c == b"A": rd.read(1)                            # abortable flag: the fake runner never aborts
     elif c == b"D":
         n = struct.unpack("<i", rd.read(4))[0]; pre = struct.unpack(f"<{n}i", rd.read(4 * n)); max_new = struct.unpack("<i", rd.read(4))[0]
         feed = {k: np.zeros(d_in[k].shape, np.float32) for k in d_in if "self" in k}
