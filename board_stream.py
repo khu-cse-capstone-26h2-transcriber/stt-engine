@@ -157,11 +157,16 @@ def flush_outbox():
         return True
 
 
-def t_at(pos):
-    """--astk: CLOCK_MONOTONIC time (s) at which sample `pos` was captured."""
+def t_at(pos, first=False):
+    """--astk: CLOCK_MONOTONIC time (s) at which sample `pos` was captured.
+    first=True: `pos` starts a span (session or segment start), so it is read from the chunk that begins there, not from
+    the chunk that ends there. The two differ when capture paused in between: audiostackd --idle sends no AUDIO between
+    'session stop' and 'session start', so the next session's first chunk comes after the idle time."""
+    ends_here = None
     for end, t_us in list(tmap):
+        if end == pos and first: ends_here = t_us; continue    # the chunk before `pos`: only if nothing came after it
         if end >= pos: return (t_us - (end - pos) * 1e6 / SR) / 1e6
-    return time.monotonic()
+    return ends_here / 1e6 if ends_here is not None else time.monotonic()
 
 
 def capture_astk():
@@ -249,8 +254,9 @@ def segmenter():
     def times(s, e):
         """Segment [s, e) samples -> session-relative ms (and capture µs under --astk, from AUDIO.t_us)."""
         if not a.astk: return dict(t0_ms=(s - sess["start"]) * 1000 // SR, t1_ms=(e - sess["start"]) * 1000 // SR)
-        if sess["t0"] is None: sess["t0"] = t_at(sess["start"])
-        ts, te = t_at(s), t_at(e)
+        if sess["t0"] is None: sess["t0"] = t_at(sess["start"], first=True)
+        s = max(s, sess["start"])                        # a session's first frame can begin a little before it
+        ts, te = t_at(s, first=True), t_at(e)
         return dict(t0_ms=max(0, round((ts - sess["t0"]) * 1000)), t1_ms=max(0, round((te - sess["t0"]) * 1000)),
                     t0_us=round(ts * 1e6), t1_us=round(te * 1e6))
 

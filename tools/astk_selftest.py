@@ -3,7 +3,8 @@ It serves engine.sock like audiostackd (HELLO, SESSION_BEGIN/END, 20 ms AUDIO wi
 replayed with the cached flag on reconnect) and scripts the cases that break integration:
   1. engine connection dropped in the middle of session 1 (--drop-at s, for --drop-for s): audio keeps being "captured",
      the engine reconnects, gets SESSION_BEGIN for the same session and the last --cache s replayed (cached flag)
-  2. session rotate at --rotate-at s: SESSION_END(s1) then SESSION_BEGIN(s2)
+  2. session rotate at --rotate-at s: SESSION_END(s1) then SESSION_BEGIN(s2); with --idle-gap g, no AUDIO for g s in
+     between while the capture clock runs on, like audiostackd --idle between 'session stop' and 'session start'
   3. SESSION_END(s2) at the end of the audio, then waits for the engine's session_done, then GOODBYE
 Checks printed at the end (PASS/FAIL): results carry the session they belong to, seg_id from 0 per session, a final per
 seg_id and no partial after it, t_start_ms increasing within a session and matching the audio position, session_done
@@ -28,6 +29,7 @@ ap.add_argument("--drop-at", type=float, default=25, help="close the engine conn
 ap.add_argument("--drop-for", type=float, default=3, help="audio captured while the engine is away (s)")
 ap.add_argument("--cache", type=float, default=10, help="audio replayed on reconnect (s), like [engine] cache_seconds")
 ap.add_argument("--rotate-at", type=float, default=45, help="session rotate at this audio time (s), 0 = never")
+ap.add_argument("--idle-gap", type=float, default=0, help="at the rotate, send no AUDIO for this long (s), 0 = rotate at once")
 ap.add_argument("--done-timeout", type=float, default=30, help="max wait for session_done after the last SESSION_END (s)")
 ap.add_argument("--log", help="write every received RESULT/ENGINE_STATUS as JSON lines here")
 a = ap.parse_args()
@@ -35,6 +37,7 @@ a = ap.parse_args()
 pcm = (np.clip(read_wav(a.wav)[: int(a.seconds * SR)], -1, 1) * 32767).astype(np.int16)
 CH = SR // 50                                          # 20 ms
 T0_US = 0                                              # capture clock: chunk end time = T0 + samples / SR (set when streaming starts)
+GAP_US = 0                                             # + time spent idle between the sessions (--idle-gap)
 os.makedirs(os.path.dirname(a.socket) or ".", exist_ok=True)
 try: os.unlink(a.socket)
 except FileNotFoundError: pass
@@ -86,7 +89,7 @@ def drain(wait=0.0):
 
 
 def audio(i, cached=False):
-    x = pcm[i:i + CH]; t_us = T0_US + int((i + len(x)) * 1e6 / SR)
+    x = pcm[i:i + CH]; t_us = T0_US + GAP_US + int((i + len(x)) * 1e6 / SR)
     send(MsgType.AUDIO, payload=x.tobytes(), flags=Flags.CACHED if cached else 0, t_us=t_us)
 
 
@@ -113,6 +116,11 @@ while i < len(pcm):
     if i >= rot_i >= 0 and state["sid"] == "sess-test-1":   # 2. rotate
         print(f"[selftest] session rotate at {i/SR:.1f}s", flush=True)
         send(MsgType.SESSION_END, {"session_id": "sess-test-1"})
+        if a.idle_gap:                                 # idle between the sessions: no AUDIO, the capture clock runs on
+            print(f"[selftest] idle {a.idle_gap:.1f}s (no AUDIO)", flush=True)
+            t_idle = time.monotonic()
+            while time.monotonic() - t_idle < a.idle_gap / a.speed: drain(0.05)
+            GAP_US += int(a.idle_gap * 1e6); t_start += a.idle_gap / a.speed
         state["sid"] = "sess-test-2"; sessions["sess-test-2"] = i; send(MsgType.SESSION_BEGIN, {"session_id": state["sid"]})
     audio(i); i += CH
     time.sleep(max(0.0, t_start + i / SR / a.speed - time.perf_counter()))
@@ -150,7 +158,8 @@ for sid, first in sessions.items():
     check(all(x < y for x, y in zip(starts, starts[1:])), f"{sid}: t_start_ms increases ({starts[:6]}...)")
     dur = (len(pcm) if sid == last else rot_i if rot_i > 0 else len(pcm)) - first
     check(all(0 <= o["t_start_ms"] <= o["t_end_ms"] <= dur * 1000 / SR + 100 for o in fin), f"{sid}: times inside the session (0..{dur/SR:.1f}s)")
-    us = [(o["t_start_us"] - T0_US) / 1e6 - first / SR for o in fin]
+    gap = GAP_US if sid == "sess-test-2" else 0
+    us = [(o["t_start_us"] - T0_US - gap) / 1e6 - first / SR for o in fin]
     check(all(abs(u * 1000 - o["t_start_ms"]) < 25 for u, o in zip(us, fin)), f"{sid}: t_start_ms = capture clock - session start")
     k_done = [k for k, o in st if o.get("event") == "session_done" and o.get("session_id") == sid]
     k_fin = [k for k, (_, t, o, _) in enumerate(got) if t == MsgType.RESULT and o.get("session_id") == sid and o["type"] == "final"]
