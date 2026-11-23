@@ -4,7 +4,7 @@ Usage (on the board):
   python3 board_asr.py --window 10 file1.wav file2.wav ...
   python3 board_asr.py --window 10 --tsv fleurs70/refs.tsv        # tsv: wav<TAB>reference, prints CER
 Bins default to ~/rubikpi/bins/{enc,dec}_{window}s.bin"""
-import argparse, json, os, pathlib, re, struct, subprocess, sys, time, wave
+import argparse, json, os, pathlib, re, struct, subprocess, sys, time, wave, signal
 import numpy as np
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -25,6 +25,14 @@ class WhisperNPU:
         b = self.p.stdout.read(n)
         if len(b) != n: sys.exit("runner died (see its stderr above)")
         return b
+
+    def abortable(self, on):
+        """Following decodes may (on) or may not be cut short by abort(). Also forgets an earlier abort()."""
+        self.p.stdin.write(b"A" + bytes([1 if on else 0])); self.p.stdin.flush()
+
+    def abort(self):
+        """Stop the running abortable decode after its current step (it returns the tokens so far)."""
+        if self.p.poll() is None and not os.environ.get("WHISPER_RUNNER"): os.kill(self.p.pid, signal.SIGUSR1)
 
     def encode(self, mel):                     # mel: (80, T) float32
         self.p.stdin.write(b"E" + np.ascontiguousarray(mel, np.float32).tobytes()); self.p.stdin.flush()

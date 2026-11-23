@@ -54,9 +54,11 @@ sha256sum -c --ignore-missing SHA256SUMS      # ONNX(Mac 시험용)는 보드에
 | 파일 | 크기 | sha256 |
 | --- | --- | --- |
 | `enc_10s.bin` | 107 MB | `c2f1212136b51563439324e732883a774c2831b0cea9538fdfc2f32a2cfc9cec` |
-| `dec_10s.bin` (전체 단어, 기본) | 223 MB | `cfb3f781820cdb6be6ef4f3c68b29b496fb1b380ab809176bdb6c779cc69577a` |
+| `dec_10s.bin` (전체 단어) | 223 MB | `cfb3f781820cdb6be6ef4f3c68b29b496fb1b380ab809176bdb6c779cc69577a` |
 | `dec_10s_pv.bin` (출력 단어 5,557개) | 187 MB | `7a56f788fbc0f7775871cad8ad9959210bc2a35a9ab2b85fb46c432e2fe7dfbb` |
 | `dec_10s_pv.vocab` (`dec_10s_pv.bin`과 함께) | 22 KB | `4451b1651b1514cbd606bf9eead5d594301769fef6d3cef877ec91a63e8045d8` |
+| `dec_10s_pv_h.bin` (출력 단어 5,557개, 크로스 캐시를 헤드별 입력으로 받음, `run_engine.sh` 기본) | 187 MB | `49759f630584f0a88c8b4bb94610a2fdcea54e92ab6d7e23f02925376aa2173b` |
+| `dec_10s_pv_h.vocab` (`dec_10s_pv_h.bin`과 함께) | 22 KB | `4451b1651b1514cbd606bf9eead5d594301769fef6d3cef877ec91a63e8045d8` |
 
 ## 설치 (보드에서)
 
