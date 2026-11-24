@@ -558,7 +558,8 @@ std::vector<int> Engine::decode(const std::vector<int>& pre, int max_new, double
   return outv;
 }
 
-// Token bytes -> UTF-8 (invalid sequences become U+FFFD like Python errors="replace"), then strip spaces.
+// Token bytes -> UTF-8 (bytes that do not form a complete character are dropped like Python errors="ignore", see
+// board_asr.detok), then strip spaces.
 static std::string detok_bytes(const std::vector<std::string>& vocab, const std::vector<int>& ids) {
   std::string b;
   for (int i : ids) if (i >= 0 && i < EOT && i < (int)vocab.size()) b += vocab[i];
@@ -569,7 +570,7 @@ static std::string detok_bytes(const std::vector<std::string>& vocab, const std:
     for (int k = 1; ok && k < n; k++) ok = ((unsigned char)b[i + k] >> 6) == 2;
     if (ok) { o.append(b, i, n); i += n; }
     else {
-      o += "\xEF\xBF\xBD"; i++;
+      i++;
       while (i < b.size() && ((unsigned char)b[i] >> 6) == 2 && n > 1) { i++; n--; }   // drop the rest of a truncated sequence
     }
   }

@@ -72,7 +72,10 @@ _vocab = {int(k): bytes.fromhex(v) for k, v in json.load(open(HERE / "vocab_byte
 
 
 def detok(ids):
-    return b"".join(_vocab.get(i, b"") for i in ids if i < EOT).decode("utf-8", errors="replace").strip()
+    # Bytes that do not form a complete UTF-8 character are dropped: the decoder sometimes starts a Hangul syllable as byte
+    # tokens and abandons it ('김종<eb a0> 열입니다'); shown as U+FFFD they were junk, and completing them made CER worse
+    # (board, TEDx 8 talks, 457 finals: U+FFFD 9 -> 0 with CER unchanged; forcing completion 5.62% -> 5.72%).
+    return b"".join(_vocab.get(i, b"") for i in ids if i < EOT).decode("utf-8", errors="ignore").strip()
 
 
 def read_wav(path):
