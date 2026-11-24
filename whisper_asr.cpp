@@ -563,16 +563,21 @@ std::vector<int> Engine::decode(const std::vector<int>& pre, int max_new, double
 static std::string detok_bytes(const std::vector<std::string>& vocab, const std::vector<int>& ids) {
   std::string b;
   for (int i : ids) if (i >= 0 && i < EOT && i < (int)vocab.size()) b += vocab[i];
+  // Strict UTF-8 like Python: no overlong forms (C0/C1, E0 80-9F, F0 80-8F), no surrogates (ED A0-BF), nothing past
+  // U+10FFFF (F4 90+, F5-FF). An invalid sequence is dropped as its lead byte plus the continuation bytes that were
+  // still valid (Python's "maximal subpart"), so the next byte is read again as a possible lead.
   std::string o; size_t i = 0;
   while (i < b.size()) {
-    unsigned char c = b[i]; int n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
-    bool ok = n > 0 && i + n <= b.size();
-    for (int k = 1; ok && k < n; k++) ok = ((unsigned char)b[i + k] >> 6) == 2;
-    if (ok) { o.append(b, i, n); i += n; }
-    else {
-      i++;
-      while (i < b.size() && ((unsigned char)b[i] >> 6) == 2 && n > 1) { i++; n--; }   // drop the rest of a truncated sequence
+    unsigned char c = b[i];
+    int n = c < 0x80 ? 1 : c >= 0xC2 && c <= 0xDF ? 2 : c >= 0xE0 && c <= 0xEF ? 3 : c >= 0xF0 && c <= 0xF4 ? 4 : 0;
+    unsigned char lo = c == 0xE0 ? 0xA0 : c == 0xF0 ? 0x90 : 0x80, hi = c == 0xED ? 0x9F : c == 0xF4 ? 0x8F : 0xBF;
+    int k = 1;   // bytes of the sequence that are valid so far
+    for (; n > 1 && k < n && i + k < b.size(); k++) {
+      unsigned char d = b[i + k];
+      if (d < (k == 1 ? lo : 0x80) || d > (k == 1 ? hi : 0xBF)) break;
     }
+    if (n > 0 && k == n) o.append(b, i, n);
+    i += k;
   }
   size_t s = o.find_first_not_of(" \t\n\r"), e = o.find_last_not_of(" \t\n\r");
   return s == std::string::npos ? "" : o.substr(s, e - s + 1);

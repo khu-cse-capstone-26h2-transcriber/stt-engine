@@ -40,7 +40,10 @@ int main(int argc, char** argv) {
   if (argc < 3) { fprintf(stderr, "usage: %s encoder.bin decoder.bin\n", argv[0]); return 1; }
   // Replies go to a private copy of stdout; fd 1 itself is pointed at stderr so that anything a library prints
   // to stdout cannot corrupt the binary protocol (it shows up in the log instead).
-  g_out = fdopen(dup(1), "wb"); dup2(2, 1);
+  const int out_fd = dup(1);
+  g_out = out_fd < 0 ? nullptr : fdopen(out_fd, "wb");
+  if (!g_out) { perror("whisper_npu: cannot open the reply pipe"); return 1; }
+  dup2(2, 1);
   const bool trace = getenv("WHISPER_TRACE") != nullptr;
   std::string exe = argv[0], dir = exe.find('/') == std::string::npos ? "." : exe.substr(0, exe.rfind('/'));
   wasr::Options opt;
