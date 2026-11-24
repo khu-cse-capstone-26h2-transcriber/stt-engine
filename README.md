@@ -67,9 +67,12 @@ sha256sum -c --ignore-missing SHA256SUMS      # ONNX(Mac 시험용)는 보드에
 
 ```bash
 sudo apt install -y g++ python3-numpy
+sudo apt install -y qcom-fastrpc1 qcom-fastrpc-dev   # NPU 접근 라이브러리 libcdsprpc.so (Qualcomm PPA, -dev가 libcdsprpc.so 링크를 깖)
 sh build.sh                                  # whisper_npu, asr_cli, bin_info, libwhisper_asr.a
 sudo sh set_governor.sh performance          # CPU 클럭 최고 고정 (재부팅하면 풀림, 측정값은 이 상태 기준)
 ```
+
+`qcom-fastrpc1`은 `libcdsprpc.so.1`만 깔기 때문에 `qcom-fastrpc-dev`도 함께 깔아야 엔진이 `libcdsprpc.so`를 찾습니다. 링크를 엔진 폴더에 직접 만들 필요는 없습니다. 이 패키지는 `linux-firmware-dragonwing`이 필요해서 `sudo apt full-upgrade` 뒤에 깔립니다. 측정한 보드는 두 패키지 모두 `1.0.15+repack2`입니다. 설치 확인: `ldconfig -p | grep libcdsprpc.so`
 
 엔진을 실행하는 사용자는 `audio` 그룹에 있어야 합니다. `audiostackd`가 `engine.sock`을 `root:audio 0660`으로 만들기 때문입니다.
 
@@ -83,12 +86,14 @@ ASTK_ENGINE_SOCKET=/tmp/astk/engine.sock DEC=dec_10s_pv.bin sh run_engine.sh
 | 환경변수 | 기본값 | 뜻 |
 | --- | --- | --- |
 | `ASTK_ENGINE_SOCKET` | `/run/audiostack/engine.sock` | 데몬 소켓 |
-| `DEC` | `dec_10s.bin` | 디코더 |
+| `DEC` | `dec_10s_pv_w4fc1.bin` | 디코더 |
 | `PARTIAL` | `2` | 중간 결과 간격(초), 0이면 끔 |
 | `CUT` | `early` | 긴 말을 자르는 방식 |
+| `PAUSES` | `0.4,0.25,0.2` | 구간을 끝내는 쉼(초). 구간 길이 3초 미만, 3~6초, 그 이상 |
 | `NOISE` | `1` | 잡음 옵션 `--adapt --lp-min -0.5` (`0`이면 끔) |
 | `STABLE` | `1` | partial 안정화 `--stable final --hold-last` (`0`이면 끔) |
 | `EXTRA` | (없음) | 그 밖의 `board_stream.py` 옵션 |
+| `GOVERNOR` | `1` | CPU 클럭이 `performance`가 아니면 `sudo -n`으로 고정(안 되면 경고만). `0`이면 건드리지 않음 |
 
 서비스로 등록하는 방법: [`whisper-engine.service`](whisper-engine.service) 맨 위 주석.
 

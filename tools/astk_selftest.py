@@ -27,6 +27,9 @@ ap.add_argument("--seconds", type=float, default=70, help="use the first N s of 
 ap.add_argument("--speed", type=float, default=1.0, help="send faster than real time (the capture clock stays real)")
 ap.add_argument("--drop-at", type=float, default=25, help="close the engine connection at this audio time (s), 0 = never")
 ap.add_argument("--drop-for", type=float, default=3, help="audio captured while the engine is away (s)")
+ap.add_argument("--proto", choices=["new", "old"], default="new",
+                help="new = audio-stack 32124c7+: AUDIO t_us is the chunk's first sample, SESSION_BEGIN carries the session's "
+                     "first-sample t_us; old = t_us is the chunk end, SESSION_BEGIN without t_us")
 ap.add_argument("--cache", type=float, default=10, help="audio replayed on reconnect (s), like [engine] cache_seconds")
 ap.add_argument("--rotate-at", type=float, default=45, help="session rotate at this audio time (s), 0 = never")
 ap.add_argument("--idle-gap", type=float, default=0, help="at the rotate, send no AUDIO for this long (s), 0 = rotate at once")
@@ -36,7 +39,7 @@ a = ap.parse_args()
 
 pcm = (np.clip(read_wav(a.wav)[: int(a.seconds * SR)], -1, 1) * 32767).astype(np.int16)
 CH = SR // 50                                          # 20 ms
-T0_US = 0                                              # capture clock: chunk end time = T0 + samples / SR (set when streaming starts)
+T0_US = 0                                              # capture clock: sample i at T0 + GAP + i / SR (set when streaming starts)
 GAP_US = 0                                             # + time spent idle between the sessions (--idle-gap)
 os.makedirs(os.path.dirname(a.socket) or ".", exist_ok=True)
 try: os.unlink(a.socket)
@@ -45,7 +48,13 @@ srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); srv.bind(a.socket); srv
 print(f"[selftest] {a.wav} {len(pcm)/SR:.1f}s, socket {a.socket}: start the engine", flush=True)
 
 got = []                                               # (recv monotonic, frame type, json, session open at the daemon then)
-state = {"sid": None, "conn": None, "client": None, "rbuf": b""}
+state = {"sid": None, "conn": None, "client": None, "rbuf": b"", "begin_us": None}
+
+
+def begin():                                           # SESSION_BEGIN for the open session (new protocol: with its origin)
+    obj = {"session_id": state["sid"]}
+    if a.proto == "new": obj["t_us"] = state["begin_us"]
+    send(MsgType.SESSION_BEGIN, obj)
 
 
 def accept():
@@ -53,7 +62,7 @@ def accept():
     state.update(conn=conn, client=c, rbuf=b"")
     c.send_frame(MsgType.HELLO, json.dumps({"proto": 1, "name": "astk_selftest", "format": {"rate": SR, "channels": 1, "encoding": "s16le"},
                                             "chunk_ms": 20, "cache_seconds": a.cache, "session_id": state["sid"]}).encode())
-    if state["sid"]: send(MsgType.SESSION_BEGIN, {"session_id": state["sid"]})
+    if state["sid"]: begin()
     print("[selftest] engine connected", flush=True)
 
 
@@ -89,7 +98,7 @@ def drain(wait=0.0):
 
 
 def audio(i, cached=False):
-    x = pcm[i:i + CH]; t_us = T0_US + GAP_US + int((i + len(x)) * 1e6 / SR)
+    x = pcm[i:i + CH]; t_us = T0_US + GAP_US + int((i + (0 if a.proto == "new" else len(x))) * 1e6 / SR)
     send(MsgType.AUDIO, payload=x.tobytes(), flags=Flags.CACHED if cached else 0, t_us=t_us)
 
 
@@ -97,11 +106,11 @@ accept()
 t_w = time.monotonic()                                 # first connect: wait for the engine's ready (model loaded)
 while time.monotonic() - t_w < 300 and not any(t == MsgType.ENGINE_STATUS and o.get("event") == "ready" for _, t, o, _ in got):
     if not drain(0.2): sys.exit("[selftest] engine closed before ready")
-state["sid"] = "sess-test-1"; send(MsgType.SESSION_BEGIN, {"session_id": state["sid"]})
+T0_US = int(time.monotonic() * 1e6)                    # capture clock starts with the first chunk, so engine latency is real
+state.update(sid="sess-test-1", begin_us=T0_US); begin()
 sessions = {"sess-test-1": 0}                         # session -> first sample
 drop_i = int(a.drop_at * SR) if a.drop_at else -1
 rot_i = int(a.rotate_at * SR) if a.rotate_at else -1
-T0_US = int(time.monotonic() * 1e6)                    # capture clock starts with the first chunk, so engine latency is real
 t_start = time.perf_counter(); i = 0; dropped = False
 while i < len(pcm):
     if i >= drop_i >= 0 and not dropped:              # 1. engine connection lost; capture continues
@@ -121,7 +130,7 @@ while i < len(pcm):
             t_idle = time.monotonic()
             while time.monotonic() - t_idle < a.idle_gap / a.speed: drain(0.05)
             GAP_US += int(a.idle_gap * 1e6); t_start += a.idle_gap / a.speed
-        state["sid"] = "sess-test-2"; sessions["sess-test-2"] = i; send(MsgType.SESSION_BEGIN, {"session_id": state["sid"]})
+        state.update(sid="sess-test-2", begin_us=T0_US + GAP_US + int(i * 1e6 / SR)); sessions["sess-test-2"] = i; begin()
     audio(i); i += CH
     time.sleep(max(0.0, t_start + i / SR / a.speed - time.perf_counter()))
     drain()

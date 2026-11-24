@@ -2,7 +2,8 @@
 #   sudo cp whisper-engine.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now whisper-engine
 #   journalctl -u whisper-engine -f
 # Needs: the user below in the "audio" group (audiostackd creates engine.sock as root:audio 0660),
-#        CPU governor "performance" for the measured speed (set_governor.sh, reset on reboot).
+#        CPU governor "performance" for the measured speed: run_engine.sh sets it if the user has passwordless sudo,
+#        otherwise run 'sudo sh set_governor.sh performance boot' once (kept after reboot).
 [Unit]
 Description=Korean Whisper STT engine on the NPU (audiostackd client)
 Wants=audiostack.service

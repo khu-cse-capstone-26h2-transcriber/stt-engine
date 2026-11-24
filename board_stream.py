@@ -65,6 +65,9 @@ ap.add_argument("--early-final", action="store_true",
                 help="start the final as soon as its audio is fixed (6 silent frames), while the pause is still being confirmed;"
                      " the result is used if the pause is confirmed with the same audio (identical output), dropped if speech resumes")
 ap.add_argument("--no-abort", action="store_true", help="let a running partial finish when a final is ready (old behaviour)")
+ap.add_argument("--no-retry", action="store_true",
+                help="keep a final that lost most of what the segment's longest partial said (default: decode it again with that "
+                     "partial, minus its last word, as forced tokens; needs --partial)")
 ap.add_argument("--hold-last", action="store_true",
                 help="partials leave out their last word (often cut off mid-word; it comes with the next partial or the final)")
 ap.add_argument("--dec", help="decoder .bin name in --bins (default dec_<window>s.bin), e.g. dec_10s_pv.bin")
@@ -123,9 +126,11 @@ class Ring:
 ring = Ring(a.buffer); segq = queue.Queue(); t0 = None
 
 client = None; marks = collections.deque()          # --astk: (sample pos, "begin"|"end", session id), in stream order
-tmap = collections.deque()                          # --astk: (sample pos at the end of an AUDIO chunk, its capture t_us)
+tmap = collections.deque()                          # --astk: (first, end sample pos of an AUDIO chunk, capture t_us of its first sample)
 _slock = threading.Lock(); outbox = collections.deque(maxlen=512)   # --astk: frames that could not be sent (disconnected)
-astk = {"connected": False, "sid": None, "dup": 0, "reconnects": 0, "last_us": 0}
+astk = {"connected": False, "sid": None, "dup": 0, "reconnects": 0, "last_us": 0,
+        "first_t": False,                            # AUDIO.t_us is the chunk's first sample (audio-stack 32124c7+: SESSION_BEGIN has t_us)
+        "begin_us": {}}                              # session id -> SESSION_BEGIN.t_us (its first sample's capture time)
 if a.astk:
     from astk_client import AudioStackClient, MsgType, Flags
 
@@ -167,11 +172,12 @@ def t_at(pos, first=False):
     first=True: `pos` starts a span (session or segment start), so it is read from the chunk that begins there, not from
     the chunk that ends there. The two differ when capture paused in between: audiostackd --idle sends no AUDIO between
     'session stop' and 'session start', so the next session's first chunk comes after the idle time."""
-    ends_here = None
-    for end, t_us in list(tmap):
-        if end == pos and first: ends_here = t_us; continue    # the chunk before `pos`: only if nothing came after it
-        if end >= pos: return (t_us - (end - pos) * 1e6 / SR) / 1e6
-    return ends_here / 1e6 if ends_here is not None else time.monotonic()
+    chunks = list(tmap); last = None
+    for c0, c1, t_us in chunks:
+        if (c0 <= pos < c1) if first else (c0 < pos <= c1): return (t_us + (pos - c0) * 1e6 / SR) / 1e6
+        if c0 <= pos: last = (c0, t_us)
+    if last: return (last[1] + (pos - last[0]) * 1e6 / SR) / 1e6     # past the newest chunk (or in a gap)
+    return time.monotonic()
 
 
 def capture_astk():
@@ -187,14 +193,18 @@ def capture_astk():
                     if f.flags & Flags.CACHED and f.t_us <= astk["last_us"]: astk["dup"] += 1; continue
                     astk["last_us"] = max(astk["last_us"], f.t_us)
                     x = np.frombuffer(f.payload, np.int16).astype(np.float32) / 32768
-                    tmap.append((ring.w + len(x), f.t_us))
+                    t_first = f.t_us if astk["first_t"] else f.t_us - len(x) * 1e6 / SR   # older daemons stamp the chunk end
+                    tmap.append((ring.w, ring.w + len(x), t_first))
                     while len(tmap) > a.buffer * 100: tmap.popleft()
                     ring.write(x)
                 elif f.type == MsgType.HELLO:
                     fmt = f.json().get("format", {})
                     if fmt.get("rate", SR) != SR: raise SystemExit(f"audiostackd sends {fmt}, need {SR} Hz")
                 elif f.type == MsgType.SESSION_BEGIN:
-                    sid = f.json().get("session_id")
+                    js = f.json(); sid = js.get("session_id")
+                    if "t_us" in js:
+                        astk["first_t"] = True
+                        if js["t_us"] is not None and sid != astk["sid"]: astk["begin_us"][sid] = js["t_us"]
                     if sid == astk["sid"]: continue                       # same session after a reconnect
                     if astk["sid"] is not None:                           # previous one never ended (daemon restarted)
                         print(f"[astk] {astk['sid']} closed without SESSION_END", flush=True)
@@ -285,7 +295,9 @@ def segmenter():
                 put(sg.flush()); sg = new(nxt); segq.put(("end", sid))
                 with plock: pending[0] = None
                 sess.update(id=None)
-            else: sess.update(id=sid, start=pos, base=seg_no, t0=None)
+            else:                                       # the daemon's session origin, if it sent one (stays the same on reconnect)
+                b = astk["begin_us"].pop(sid, None)
+                sess.update(id=sid, start=pos, base=seg_no, t0=b / 1e6 if b is not None else None)
 
     while (f := ring.read(FRAME)) is not None:
         if not len(f):                                  # poked by a session event: the < 1 frame not read yet is dropped
@@ -330,6 +342,7 @@ out, stats, segs, kinds = [], [], [], []
 
 
 fstats = {"segs": 0, "chars": 0}
+rstats = {"tried": 0, "kept": 0}                      # finals decoded again because they lost the longest partial's text
 
 
 def clean_text(text, final):
@@ -339,6 +352,7 @@ def clean_text(text, final):
 
 
 pstable = {}                                          # --stable: segment -> (committed tokens, previous partial tokens)
+plong = {}                                            # segment -> tokens of its longest partial (for retry_prefix)
 
 
 def word_start(t): return _vocab.get(t, b"").startswith(b" ")
@@ -360,6 +374,19 @@ def commit(n, full):
     return com
 
 
+def retry_prefix(n, com, toks):
+    """The decoder sometimes skips the middle of a long segment or stops early (e.g. '때때로는 밀대 세의 울음소리가' where the
+    partials said '때때로는 바람이 풀밭에 스치는 소리를 …'; the last partial can already be the short one). If the final keeps
+    under 60% of the characters of the segment's longest partial (which saw a shorter part of the same audio), return that
+    partial's tokens up to its last word to force."""
+    prev = plong.get(n, [])
+    pc, fc = len(norm(detok(prev))), len(norm(detok(com + toks)))
+    if pc < 10 or fc >= 0.6 * pc: return None
+    k = len(prev) - 1
+    while k > len(com) and not word_start(prev[k]): k -= 1       # drop the last word (often cut off in a partial)
+    return prev[:k] if k > len(com) else None
+
+
 def run_partial(job, done):
     n, s, e, x, info = job
     if n <= done: pstats["skipped"] += 1; return        # its final already went out
@@ -372,6 +399,7 @@ def run_partial(job, done):
     if pabort.is_set():                              # a final came in and cut this partial short: drop it
         pstats["aborted"] += 1; print(f"[partial seg {n}] stopped for a final ({len(toks)} tok)", flush=True); return
     full = com + toks
+    if len(norm(detok(full))) > len(norm(detok(plong.get(n, [])))): plong[n] = full
     text = clean_text(detok(full), False); proc = time.perf_counter() - ts
     stable = None
     if a.stable != "off" and text: stable = len(detok(commit(n, full)))
@@ -441,6 +469,15 @@ def infer():
         else:
             if a.partial or a.early_final: model.abortable(False)
             enc_ms = model.encode(log_mel(x, a.window)); toks, dec_ms, _ = model.decode(seconds=len(x) / SR, forced=com)
+        fp = None if a.no_retry else retry_prefix(n, com, toks)
+        if fp:                                           # lost the longest partial's text: decode again with it forced
+            rstats["tried"] += 1; old = detok(com + toks)
+            model.abortable(False); enc_ms += model.encode(log_mel(x, a.window))   # the last encode may be another job's audio
+            toks2, dec2, _ = model.decode(seconds=len(x) / SR, forced=fp); dec_ms += dec2
+            if len(norm(detok(fp + toks2))) > len(norm(old)):
+                com, toks = fp, toks2; rstats["kept"] += 1
+            print(f"[retry seg {n}] {old} -> {detok(com + toks)}", flush=True)
+        for k in [k for k in plong if k <= n]: del plong[k]
         text = clean_text(detok(com + toks), True); proc = time.perf_counter() - ts
         if prev_forced: text = merge(last, text)
         out.append(text); last = text or last; prev_forced = forced; done = n
@@ -480,6 +517,7 @@ seg_s = sum(st[0] for st in stats) / SR
 print(f"\nbuffer overflow (dropped samples): {ring.dropped}")
 if a.astk: print(f"ASTK reconnects {astk['reconnects']}, cached duplicates skipped {astk['dup']} chunks, unsent {len(outbox)}")
 print(f"cuts: pause {kinds.count('pause') + kinds.count('end')}, dip {kinds.count('dip')}, forced {kinds.count('forced')} (--cut {a.cut})")
+if rstats["tried"]: print(f"RETRY finals decoded again: {rstats['tried']}, kept {rstats['kept']}")
 if a.lp_min is not None: print(f"FILTER lp < {a.lp_min}: {fstats['segs']} segments, {fstats['chars']} chars dropped")
 if a.partial:
     pr = pstats["run"]
