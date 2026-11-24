@@ -11,9 +11,10 @@ mic → audiostackd ─AUDIO/SESSION_*→ stt-engine (NPU) ─RESULT/ENGINE_STAT
 
 ## 보드 성능 (Ubuntu 24.04, QNN 2.50, CPU 클럭 최고 고정)
 
-| 평가 (2026-11-02, 11-09) | CER | RTF 평균 / 최대 | final 지연 평균 / 최대 |
+| 평가 (2026-11-02, 11-09, 11-24) | CER | RTF 평균 / 최대 | final 지연 평균 / 최대 |
 | --- | --- | --- | --- |
-| TEDx 강연 41개, 실시간 연속 입력, 중간 결과 2초, `dec_10s.bin` (기본) | 5.5% | 0.115 / 0.131 | 0.98 / 2.96 s |
+| TEDx 강연 41개, 실시간 연속 입력, `run_engine.sh` 기본값 (`dec_10s_pv_w4fc1.bin`, 구간 끝 대기 0.4/0.25/0.2초, 잡음 대응, partial 안정화) | 5.8% | 0.078 / 0.103 | 0.50 / 4.56 s (99%가 0.88 s 이내) |
+| TEDx 강연 41개, 실시간 연속 입력, 중간 결과 2초, `dec_10s.bin` (11-02) | 5.5% | 0.115 / 0.131 | 0.98 / 2.96 s |
 | 같은 조건, `dec_10s_pv.bin` | 5.5% | 0.105 / 0.121 | 0.90 / 2.89 s |
 | 실제 `audiostackd`를 거침 (snd-aloop, talk04 162초) | 3.5% | - | 1.07 / 1.77 s |
 
@@ -57,8 +58,10 @@ sha256sum -c --ignore-missing SHA256SUMS      # ONNX(Mac 시험용)는 보드에
 | `dec_10s.bin` (전체 단어) | 223 MB | `cfb3f781820cdb6be6ef4f3c68b29b496fb1b380ab809176bdb6c779cc69577a` |
 | `dec_10s_pv.bin` (출력 단어 5,557개) | 187 MB | `7a56f788fbc0f7775871cad8ad9959210bc2a35a9ab2b85fb46c432e2fe7dfbb` |
 | `dec_10s_pv.vocab` (`dec_10s_pv.bin`과 함께) | 22 KB | `4451b1651b1514cbd606bf9eead5d594301769fef6d3cef877ec91a63e8045d8` |
-| `dec_10s_pv_h.bin` (출력 단어 5,557개, 크로스 캐시를 헤드별 입력으로 받음, `run_engine.sh` 기본) | 187 MB | `49759f630584f0a88c8b4bb94610a2fdcea54e92ab6d7e23f02925376aa2173b` |
+| `dec_10s_pv_h.bin` (출력 단어 5,557개, 크로스 캐시를 헤드별 입력으로 받음) | 187 MB | `49759f630584f0a88c8b4bb94610a2fdcea54e92ab6d7e23f02925376aa2173b` |
 | `dec_10s_pv_h.vocab` (`dec_10s_pv_h.bin`과 함께) | 22 KB | `4451b1651b1514cbd606bf9eead5d594301769fef6d3cef877ec91a63e8045d8` |
+| `dec_10s_pv_w4fc1.bin` (`dec_10s_pv_h.bin`에서 FFN fc1 가중치만 4bit, 디코더 스텝 14% 빠름, CER +0.16%p, `run_engine.sh` 기본) | 173 MB | `68b7d8cd9a37331a999fa195be7394ed6f5ebd2cb9dae90831accf4234f9cee7` |
+| `dec_10s_pv_w4fc1.vocab` (`dec_10s_pv_w4fc1.bin`과 함께) | 22 KB | `4451b1651b1514cbd606bf9eead5d594301769fef6d3cef877ec91a63e8045d8` |
 
 ## 설치 (보드에서)
 
